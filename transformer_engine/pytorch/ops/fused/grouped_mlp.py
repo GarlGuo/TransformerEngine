@@ -198,7 +198,16 @@ def _group_quantize_for_grouped_mlp(
 ) -> GroupedTensor:
     """Quantize into grouped storage."""
 
-    if num_groups != 1 or not isinstance(quantizer, (MXFP8Quantizer, NVFP4Quantizer)):
+    # ``split_sizes is None`` is the caller declaring one dense group spanning the whole
+    # tensor (weights). With explicit splits the tensor may be a fixed-capacity buffer whose
+    # rows past ``sum(split_sizes)`` belong to no group, and a dense quantize would lay the
+    # scales out for ``tensor.shape[0]`` rows while the fused kernels pack theirs to
+    # ``sum(split_sizes)`` rows -- see the layout note in ``fuser_forward``.
+    if (
+        num_groups != 1
+        or split_sizes is not None
+        or not isinstance(quantizer, (MXFP8Quantizer, NVFP4Quantizer))
+    ):
         return tex.group_quantize(
             tensor,
             quantizer,
@@ -712,19 +721,13 @@ def _compute_grad_params(
             raise RuntimeError(
                 "distributed-weight fused grouped-MLP requires delay_wgrad_compute=False."
             )
-        if (
-            num_groups == 1
-            and isinstance(grouped_x, (GroupedTensor, GroupedTensorStorage))
-            and isinstance(grouped_dy, (GroupedTensor, GroupedTensorStorage))
-            and isinstance(grouped_x.quantizer, (MXFP8Quantizer, NVFP4Quantizer))
-            and isinstance(grouped_dy.quantizer, grouped_x.quantizer.__class__)
-        ):
-            gemm_fn = functools.partial(
-                _single_group_wgrad_gemm,
-                weight_shape=weight_shape,
-                accumulate=accumulate_into_main_grad,
-            )
-        elif cudnn_wgrad_kernel_fn is not None:
+        # NOTE: a dense single-group wgrad GEMM is not valid here. Both operands are
+        # activations, whose MXFP8 columnwise scales the fused kernels pack to
+        # ``sum(split_sizes)`` rows, while a dense read indexes them over
+        # ``logical_shape[0]``. Because the columnwise layout is
+        # ``[k/128][m/128][32][4][4]``, an m-tile count mismatch misindexes every k-tile
+        # past the first, silently corrupting the weight gradient.
+        if cudnn_wgrad_kernel_fn is not None:
             offsets = offsets if offsets.dtype == torch.int32 else offsets.to(dtype=torch.int32)
             gemm_fn = functools.partial(
                 _cudnn_compute_wgrad,
